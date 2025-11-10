@@ -1,43 +1,28 @@
 import os
 import itertools
-import dimod
 import numpy as np
+import dimod
 from dotenv import load_dotenv
-from qiskit import QuantumCircuit
+from iqm.iqm_client import IQMClient
 from iqm.qiskit_iqm import IQMProvider, transpile_to_IQM
+from qiskit import QuantumCircuit
+from qiskit.algorithms import QAOA
+from qiskit.primitives import Sampler
+from qiskit_optimization import QuadraticProgram
+from qiskit_optimization.converters import from_dimod_bqm
 
 # Load environment variables
 load_dotenv()
-SERVER_URL = os.getenv("SERVER_URL")  # e.g., "https://cocos.resonance.meetiqm.com/sirius"
+SERVER_URL = os.getenv("SERVER_URL")  
 API_TOKEN = os.environ.get("RESONANCE_API_TOKEN")
 
-# Define shots for test circuits
-SHOTS = 1000
-
-# -----------------------------
-# Step 1: Connect to IQM provider
-# -----------------------------
+# Connect to IQM provider
 provider = IQMProvider(url=SERVER_URL, token=API_TOKEN)
 backend = provider.get_backend('resonance_qpu')  # adjust for your target backend
 
 print("Connected to IQM backend:", backend.name)
 
-# -----------------------------
-# Step 2: Optional test circuit
-# -----------------------------
-qc_test = QuantumCircuit(2)
-qc_test.h(0)
-qc_test.cx(0, 1)
-qc_test.measure_all()
-
-qc_test_transpiled = transpile_to_IQM(qc_test, backend)
-
-job_test = backend.run(qc_test_transpiled, shots=SHOTS)
-print("Test circuit result:", job_test.result().get_counts())
-
-# -----------------------------
-# Step 3: Define your QUBO problem
-# -----------------------------
+# Define your QUBO problem
 sources = ['A', 'B']
 sinks = {'C': 3, 'D': 2}
 battery = 'E'
@@ -103,19 +88,22 @@ for v1, v2 in itertools.combinations(incoming_to_bat + outgoing_from_bat, 2):
     quadratic_key = tuple(sorted([v1, v2]))
     quadratic[quadratic_key] = quadratic.get(quadratic_key, 0.0) + 2 * penalty * (coeff1 * coeff2)
 
-# -----------------------------
-# Step 4: Build BQM and sample
-# -----------------------------
+# Build BQM and sample
 bqm = dimod.BinaryQuadraticModel({}, {}, 0.0, dimod.BINARY)
 for v, c in linear.items():
     bqm.add_variable(v, c)
 for (v1, v2), q in quadratic.items():
     bqm.add_interaction(v1, v2, q)
 
-sampler = dimod.SimulatedAnnealingSampler()
-sampleset = sampler.sample(bqm, num_reads=200)
-best = sampleset.first
+# Convert BQM to Qiskit QuadraticProgram
+qubo = from_dimod_bqm(bqm)
 
-print("Best sample (binary values):")
-print(best.sample)
-print("Energy:", best.energy)
+# Run QAOA on IQM backend (quantom omptimizing)
+sampler = Sampler(backend=backend)
+qaoa = QAOA(sampler=sampler, reps=2)
+result = qaoa.compute_minimum_eigenvalue(operator=qubo.to_ising()[0])
+
+# Display results
+print("\n Optimization complete!")
+print("Minimum energy: ", result.eigenvalue.real)
+print("Optimal parameters: ", result.optimal_parameters)
