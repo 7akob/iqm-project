@@ -12,7 +12,7 @@ source iqm-env/bin/activate
 ```
 3. Install dependencies (inside envoirement)
 ```bash
-pip install -r requirements.txt
+pip install -r requirements_IQM.txt
 ```
 4. Run the script
 ```bash
