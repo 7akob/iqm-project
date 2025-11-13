@@ -1,102 +1,207 @@
 import os
-import numpy as np
+import itertools
 from dotenv import load_dotenv
+from scipy.optimize import minimize
+import dimod
 
-# Qiskit core imports
-from qiskit import QuantumCircuit
-from qiskit_optimization import QuadraticProgram
-from qiskit_optimization.algorithms import MinimumEigenOptimizer
-from qiskit_algorithms import QAOA
-from qiskit_algorithms.optimizers import COBYLA
-from qiskit_ionq import IonQProvider
-from qiskit.primitives import Sampler
-
-# Load credentials
 load_dotenv()
+
+# CONFIGURATION
 IONQ_API_KEY = os.getenv("IONQ_API_KEY")
-
 if not IONQ_API_KEY:
-    raise EnvironmentError("Missing IONQ_API_KEY in .env file")
+    raise RuntimeError("Set IONQ_API_KEY in .env file")
 
-provider = IonQProvider(token=IONQ_API_KEY)
-backend = provider.get_backend("ionq_qpu")  # or "ionq_simulator"
-print(f"✅ Connected to IonQ backend: {backend.name()}")
+# Problem definition
+sources = ['A', 'B']
+sinks = {'C': 3, 'D': 2}
+battery = 'E'
+Gmax = {'A': 3, 'B': 2}
+cost = {'A': 2.0, 'B': 3.0}
 
-# Define network flow problem
-nodes = ["A", "B", "C", "D", "E"]
-
-sources = {"A": {"cap": 3, "cost": 1}, "B": {"cap": 2, "cost": 1}}
-sinks = {"C": {"demand": 3}, "D": {"demand": 2}}
-storage = {"E": {"cap": 2, "init": 1}}
-
-arcs = [
-    ("A", "C"), ("A", "D"), ("A", "E"),
-    ("B", "C"), ("B", "D"), ("B", "E"),
-    ("E", "C"), ("E", "D")
+nodes = ['A', 'B', 'C', 'D', 'E']
+valid_arcs = [
+    (i, j) for i in nodes for j in nodes if i != j
+    and ((i in sources and j in ['C', 'D', 'E']) or (i == 'E' and j in ['C', 'D']))
 ]
 
-var_names = [f"f_{i}_{j}" for (i, j) in arcs]
-print(f"\nProblem uses {len(arcs)} binary variables:")
-print(" ", var_names)
+var_names = [f"f_{i}_{j}" for (i, j) in valid_arcs]
+n_vars = len(var_names)
+print(f"Problem: {n_vars} binary variables")
+print(f"Variables: {var_names}\n")
 
-# Build QUBO model
-qubo = QuadraticProgram()
-
-for name in var_names:
-    qubo.binary_var(name)
-
-# Linear term = source generation costs
-linear = {f"f_{i}_{j}": sources.get(i, {}).get("cost", 0) for (i, j) in arcs}
+# BUILD QUBO
+penalty = 8.0
+linear = {}
 quadratic = {}
 
-# Add penalties for unmet demand
-for sink, data in sinks.items():
-    related = [f"f_{i}_{sink}" for (i, j) in arcs if j == sink]
-    for a in related:
-        quadratic[(a, a)] = quadratic.get((a, a), 0) + 1
-        linear[a] -= 2 * data["demand"]
+# Source costs
+for v in var_names:
+    src = v.split('_')[1]
+    if src in sources:
+        linear[v] = linear.get(v, 0.0) + cost[src]
 
-qubo.minimize(linear=linear, quadratic=quadratic)
+# Demand constraints
+for sink, demand in sinks.items():
+    incoming = [v for v in var_names if v.endswith(f"_{sink}")]
+    for v in incoming:
+        linear[v] = linear.get(v, 0.0) + penalty - 2.0 * penalty * demand
+    for v1, v2 in itertools.combinations(incoming, 2):
+        k = tuple(sorted([v1, v2]))
+        quadratic[k] = quadratic.get(k, 0.0) + 2.0 * penalty
 
-# Convert to Ising form (modern Qiskit version)
-ising = qubo.to_ising()
+# Capacity constraints
+for src in sources:
+    outgoing = [v for v in var_names if v.startswith(f"f_{src}_")]
+    for v in outgoing:
+        linear[v] = linear.get(v, 0.0) + penalty - 2.0 * penalty * Gmax[src]
+    for v1, v2 in itertools.combinations(outgoing, 2):
+        k = tuple(sorted([v1, v2]))
+        quadratic[k] = quadratic.get(k, 0.0) + 2.0 * penalty
 
-if len(ising) == 2:
-    operator, offset = ising
-    print(f"\nBuilt Ising Hamiltonian with offset {offset:.3f}")
-else:
-    linear, quadratic, offset = ising
-    print(f"\nBuilt BQM: {len(linear)} linear terms; {len(quadratic)} quadratic terms")
+# Build BQM
+bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
+print(f"Built BQM: {len(bqm.linear)} linear, {len(bqm.quadratic)} quadratic terms\n")
 
-# Setup and run QAOA on IonQ
-sampler = Sampler()
-qaoa = QAOA(sampler=sampler, reps=2, optimizer=COBYLA(maxiter=50))
-optimizer = MinimumEigenOptimizer(qaoa)
+# CONNECT TO IONQ
+from qiskit_ionq import IonQProvider
+from qiskit import QuantumCircuit, transpile
 
-print("\n🚀 Running QAOA optimization on IonQ (this may take several minutes)...")
-result = optimizer.solve(qubo)
+provider = IonQProvider(token=IONQ_API_KEY)
+backend = provider.get_backend("ionq_simulator") 
+# backend = provider.get_backend("ionq_qpu")      # Uncomment for real hardware
 
-# Display results
-bitstring = "".join(str(int(v)) for v in result.x)
-print("\n=== Optimization Result ===")
-print(f"Best measured bitstring: {bitstring}")
-print(f"Objective value: {result.fval:.3f}")
+print(f"Connected to: {backend.name}\n")
 
-print("\nActive flows (1 = flow on arc):")
-for k, val in zip(var_names, result.x):
-    if val > 0.5:
-        i, j = k.split("_")[1:]
-        print(f"  {i} -> {j}")
+# BUILD QAOA CIRCUIT
+var_to_idx = {v: i for i, v in enumerate(var_names)}
+n_qubits = n_vars
+shots = 512
+p = 1 
 
-# Sanity checks
-print("\nDemand checks:")
-for sink, data in sinks.items():
-    inflow = sum(result.variables_dict.get(f"f_{i}_{sink}", 0) for i in sources.keys() | storage.keys())
-    print(f"  {sink}: {inflow}/{data['demand']} {'✓' if inflow >= data['demand'] else '✗'}")
+def build_qaoa_circuit(params):
+    """Build QAOA ansatz circuit"""
+    gammas = params[:p]
+    betas = params[p:2*p]
+    
+    qc = QuantumCircuit(n_qubits)
+    
+    # Initial superposition
+    qc.h(range(n_qubits))
+    
+    for level in range(p):
+        gamma = float(gammas[level])
+        
+        # Apply problem Hamiltonian (quadratic terms)
+        for (u, v), coeff in bqm.quadratic.items():
+            q1 = var_to_idx[u]
+            q2 = var_to_idx[v]
+            angle = -2.0 * gamma * coeff
+            qc.cx(q1, q2)
+            qc.rz(angle, q2)
+            qc.cx(q1, q2)
+        
+        # Apply problem Hamiltonian (linear terms)
+        for vname, coeff in bqm.linear.items():
+            q = var_to_idx[vname]
+            angle = -gamma * coeff
+            qc.rz(angle, q)
+        
+        # Apply mixer Hamiltonian
+        beta = float(betas[level])
+        for q in range(n_qubits):
+            qc.rx(2.0 * beta, q)
+    
+    qc.measure_all()
+    return qc
 
-print("\nSource capacity checks:")
-for src, data in sources.items():
-    outflow = sum(result.variables_dict.get(f"f_{src}_{j}", 0) for j in nodes if (src, j) in arcs)
-    print(f"  {src}: {outflow}/{data['cap']} {'✓' if outflow <= data['cap'] else '✗'}")
+# ENERGY EVALUATION ON IONQ
+def energy_from_counts(counts):
+    """Calculate expected energy from measurement counts"""
+    total = sum(counts.values())
+    avg_energy = 0.0
+    for bitstr, cnt in counts.items():
+        # Convert bitstring to variable assignment
+        sample = {v: int(bitstr[i]) for i, v in enumerate(var_names)}
+        e = bqm.energy(sample)
+        avg_energy += (cnt / total) * e
+    return avg_energy
 
-print("\n✅ Finished successfully.")
+def hardware_eval(params):
+    """Evaluate energy on IonQ hardware"""
+    qc = build_qaoa_circuit(params)
+    
+    # Transpile for IonQ
+    qc_transpiled = transpile(qc, backend=backend, optimization_level=1)
+    
+    # Run on IonQ
+    job = backend.run(qc_transpiled, shots=shots)
+    result = job.result()
+    counts = result.get_counts()
+    
+    energy = energy_from_counts(counts)
+    print(f"  params: {[round(float(x), 4) for x in params]} -> energy: {round(energy, 4)}")
+    return energy
+
+# RUN OPTIMIZATION
+print("Starting QAOA optimization on IonQ...")
+print("(Each iteration runs a quantum circuit on hardware)\n")
+
+init_params = [0.5] * (2 * p)
+result = minimize(
+    hardware_eval,
+    x0=init_params,
+    method='COBYLA',
+    options={'maxiter': 6}
+)
+
+print(f"\nOptimization complete!")
+print(f"Best parameters: {[round(x, 4) for x in result.x]}\n")
+
+# FINAL RUN WITH BEST PARAMETERS
+print("Running final circuit with optimized parameters...")
+best_params = result.x
+final_qc = build_qaoa_circuit(best_params)
+final_qc_transpiled = transpile(final_qc, backend=backend, optimization_level=1)
+
+job = backend.run(final_qc_transpiled, shots=shots)
+final_result = job.result()
+counts = final_result.get_counts()
+
+print(f"Final counts: {counts}\n")
+
+# Get best bitstring
+best_bitstring = max(counts, key=counts.get)
+best_sample = {v: int(best_bitstring[i]) for i, v in enumerate(var_names)}
+best_energy = bqm.energy(best_sample)
+
+# DISPLAY RESULTS
+print("="*70)
+print("SOLUTION")
+print("="*70)
+print(f"\nBest bitstring: {best_bitstring}")
+print(f"Energy: {best_energy:.2f}\n")
+
+print("Active flows:")
+total_cost = 0.0
+for v in var_names:
+    if best_sample[v] == 1:
+        src, dst = v.split('_')[1], v.split('_')[2]
+        print(f"  {src} → {dst}")
+        if src in sources:
+            total_cost += cost[src]
+
+print(f"\nTotal cost: {total_cost:.2f}\n")
+
+print("Demand checks:")
+for sink, demand in sinks.items():
+    received = sum(best_sample[v] for v in var_names if v.endswith(f"_{sink}"))
+    status = "✓" if received >= demand else "✗"
+    print(f"  {status} {sink}: {received}/{demand}")
+
+print("\nCapacity checks:")
+for src in sources:
+    generated = sum(best_sample[v] for v in var_names if v.startswith(f"f_{src}_"))
+    status = "✓" if generated <= Gmax[src] else "✗"
+    print(f"  {status} {src}: {generated}/{Gmax[src]}")
+
+print("\n" + "="*70)
