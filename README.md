@@ -1,7 +1,7 @@
-# 5-node Flow Optimization on IQM Quantom Backend
+# 5-node Flow Optimization on Quantom Backend
 
 ## Overview
-This experiment demonstrates solving a 5-node notwork flow optimization problem using IQM's quantom hardware through the `iqm-client` and `qiskit` integration. The goal is to find a optimal binary flow assignments that minimize energy(cost) while satysfying demand and capacity constraints for each node.
+This experiment demonstrates solving a 5-node notwork flow optimization problem using IQM's and IonQ's quantom hardware through the `iqm-client` and `qiskit` integration. The goal is to find a optimal binary flow assignments that minimize energy(cost) while satysfying demand and capacity constraints for each node.
 
 ## How to setup
 1. Rename `.env.example` to `.env` and set your personal api_token and quantom computer url in the `.env` file. 
